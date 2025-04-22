@@ -1,4 +1,3 @@
-
 library(shiny)
 library(shinythemes)
 library(shinydashboard)
@@ -7,6 +6,8 @@ library(dplyr)
 library(ggplot2)
 library(DescTools)
 library(tidyr)
+library(stats)
+library(coin)
 
 # Función segura para calcular la moda
 moda_segura <- function(x) {
@@ -32,7 +33,8 @@ ui <- dashboardPage(
       menuItem("Importar Datos", tabName = "importar", icon = icon("file-import")),
       menuItem("Estadísticas Descriptivas", tabName = "descriptivas", icon = icon("chart-bar")),
       menuItem("Pruebas e Interpretación", tabName = "pruebas", icon = icon("flask")),
-      menuItem("Extras", tabName = "extras", icon = icon("plus-circle"))
+      menuItem("Extras", tabName = "extras", icon = icon("plus-circle")),
+      menuItem("Nuevas Pruebas", tabName = "nuevas_pruebas", icon = icon("plus"))
     )
   ),
   dashboardBody(
@@ -70,6 +72,21 @@ ui <- dashboardPage(
                 box(title = "Boxplot comparativo", width = 12, solidHeader = TRUE, status = "info",
                     plotOutput("boxplot_grupos"))
               )
+      ),
+      tabItem("nuevas_pruebas",
+              fluidRow(
+                box(title = "Prueba Chi-cuadrada", width = 6, solidHeader = TRUE, status = "warning",
+                    verbatimTextOutput("chi_cuadrada")),
+                box(title = "Teorema del Límite Central", width = 6, solidHeader = TRUE, status = "info",
+                    plotOutput("tlc_plot"),
+                    verbatimTextOutput("tlc"))
+              ),
+              fluidRow(
+                box(title = "Prueba de Wilcoxon", width = 6, solidHeader = TRUE, status = "danger",
+                    verbatimTextOutput("wilcoxon")),
+                box(title = "Correlación de Spearman y Pearson", width = 6, solidHeader = TRUE, status = "success",
+                    verbatimTextOutput("correlacion"))
+              )
       )
     )
   )
@@ -78,14 +95,22 @@ ui <- dashboardPage(
 server <- function(input, output, session) {
   datos <- reactive({
     req(input$archivo)
-    if (grepl(".csv", input$archivo$name)) {
-      read.csv(input$archivo$datapath)
-    } else {
-      read_excel(input$archivo$datapath)
-    }
+    tryCatch({
+      if (grepl(".csv$", input$archivo$name, ignore.case = TRUE)) {
+        read.csv(input$archivo$datapath)
+      } else {
+        read_excel(input$archivo$datapath)
+      }
+    }, error = function(e) {
+      showNotification("Error al leer el archivo", type = "error")
+      NULL
+    })
   })
   
-  output$vista_datos <- renderTable({ head(datos()) })
+  output$vista_datos <- renderTable({
+    req(datos())
+    head(datos())
+  })
   
   output$seleccion_vars <- renderUI({
     req(datos())
@@ -115,19 +140,24 @@ server <- function(input, output, session) {
           datos_col <- datos()[[v]]
           if (is.numeric(datos_col)) {
             data.frame(
-              Media = mean(datos_col, na.rm = TRUE),
-              Mediana = median(datos_col, na.rm = TRUE),
-              Moda = moda_segura(datos_col),
-              Mínimo = min(datos_col, na.rm = TRUE),
-              Máximo = max(datos_col, na.rm = TRUE),
-              Rango = max(datos_col, na.rm = TRUE) - min(datos_col, na.rm = TRUE),
-              Desv_Estandar = sd(datos_col, na.rm = TRUE),
-              Coef_Variacion = round(sd(datos_col, na.rm = TRUE) / mean(datos_col, na.rm = TRUE), 3)
+              Estadístico = c("Media", "Mediana", "Moda", "Mínimo", "Máximo", 
+                              "Rango", "Desv. Estandar", "Coef. Variación"),
+              Valor = c(
+                mean(datos_col, na.rm = TRUE),
+                median(datos_col, na.rm = TRUE),
+                moda_segura(datos_col),
+                min(datos_col, na.rm = TRUE),
+                max(datos_col, na.rm = TRUE),
+                max(datos_col, na.rm = TRUE) - min(datos_col, na.rm = TRUE),
+                sd(datos_col, na.rm = TRUE),
+                round(sd(datos_col, na.rm = TRUE) / mean(datos_col, na.rm = TRUE), 3)
+              )
             )
           } else {
-            as.data.frame(table(datos_col))
+            as.data.frame(table(datos_col)) %>% 
+              rename(Categoría = 1, Frecuencia = 2)
           }
-        }, rownames = TRUE)
+        }, rownames = FALSE)
       })
     }
   })
@@ -135,7 +165,11 @@ server <- function(input, output, session) {
   output$graficos_ui <- renderUI({
     req(input$variables)
     plots <- lapply(input$variables, function(var) {
-      tagList(h4(paste("Gráfico:", var)), plotOutput(paste0("plot_", var)))
+      tagList(
+        h4(paste("Gráfico:", var)), 
+        plotOutput(paste0("plot_", var)),
+        br()
+      )
     })
     do.call(tagList, plots)
   })
@@ -150,11 +184,15 @@ server <- function(input, output, session) {
           if (is.numeric(datos_col)) {
             ggplot(data.frame(x = datos_col), aes(x = x)) +
               geom_histogram(bins = 15, fill = "#2E86C1", color = "white") +
-              theme_minimal() + labs(title = paste("Histograma de", v), x = v)
+              geom_density(aes(y = ..count..), color = "#1F618D", size = 1) +
+              theme_minimal() + 
+              labs(title = paste("Histograma de", v), x = v, y = "Frecuencia")
           } else {
             ggplot(data.frame(x = datos_col), aes(x = x)) +
               geom_bar(fill = "#E67E22") +
-              theme_minimal() + labs(title = paste("Gráfico de barras de", v), x = v)
+              theme_minimal() + 
+              labs(title = paste("Gráfico de barras de", v), x = v) +
+              theme(axis.text.x = element_text(angle = 45, hjust = 1))
           }
         })
       })
@@ -171,7 +209,16 @@ server <- function(input, output, session) {
     var1 <- df[[vars[1]]]
     var2 <- df[[vars[2]]]
     
-    if (is.numeric(var1) && (is.factor(var2) || is.character(var2))) {
+    if (is.numeric(var1) && is.numeric(var2)) {
+      return(cor.test(var1, var2, method = "pearson"))
+    } else if (is.factor(var1) && is.factor(var2) && length(levels(var1)) == 2 && length(levels(var2)) == 2) {
+      tabla <- table(var1, var2)
+      if (all(dim(tabla) == c(2, 2))) {
+        return(mcnemar.test(tabla))
+      }
+    } else if (all(sapply(df[vars], function(x) all(x %in% c(0, 1))))) {
+      return(CochranQTest(as.matrix(df[vars])))
+    } else if (is.numeric(var1) && (is.factor(var2) || is.character(var2))) {
       var2 <- as.factor(var2)
       if (length(levels(var2)) == 2) {
         return(t.test(var1 ~ var2))
@@ -196,26 +243,22 @@ server <- function(input, output, session) {
   output$resultado_prueba <- renderPrint({
     res <- prueba_resultado()
     if (is.null(res)) {
-      cat("❌ No se pudo aplicar la prueba. Selecciona una variable numérica y otra categórica.")
-    } else if (inherits(res, "htest")) {
+      cat("❌ No se pudo aplicar la prueba. Selecciona variables adecuadas.")
+    } else {
       print(res)
-    } else if (is.list(res)) {
-      print(summary(res$aov_model))
-      cat("\n📊 Prueba de Tukey:\n")
-      print(res$tukey)
     }
   })
   
   output$texto_interpretacion <- renderPrint({
     res <- prueba_resultado()
     if (is.null(res)) {
-      cat("No se puede interpretar. Asegúrate de seleccionar una variable numérica y otra categórica.")
+      cat("No se puede interpretar. Asegúrate de seleccionar variables válidas.")
     } else if (inherits(res, "htest")) {
       p <- res$p.value
       if (p < 0.05) {
-        cat("✅ Hay diferencia significativa entre los grupos. (p =", round(p, 4), ")")
+        cat("✅ Diferencia o relación significativa encontrada. (p =", round(p, 4), ")")
       } else {
-        cat("ℹ️ No hay diferencia significativa entre los grupos. (p =", round(p, 4), ")")
+        cat("ℹ️ No hay diferencia o relación significativa. (p =", round(p, 4), ")")
       }
     } else if (is.list(res)) {
       p <- summary(res$aov_model)[[1]][["Pr(>F)"]][1]
@@ -227,16 +270,22 @@ server <- function(input, output, session) {
     }
   })
   
-  # Análisis extra: Normalidad
+  # Análisis de normalidad (Shapiro-Wilk)
   output$normalidad <- renderPrint({
     req(input$variables)
     var <- input$variables[1]
-    x <- datos()[[var]]
-    if (is.numeric(x)) {
-      test <- shapiro.test(x)
-      print(test)
+    datos_col <- datos()[[var]]
+    if (is.numeric(datos_col) && length(datos_col) >= 3 && length(datos_col) <= 5000) {
+      normalidad_test <- shapiro.test(datos_col)
+      cat("Resultado de la prueba de normalidad (Shapiro-Wilk):\n")
+      cat("Valor p: ", round(normalidad_test$p.value, 4), "\n")
+      if (normalidad_test$p.value < 0.05) {
+        cat("❌ La variable NO sigue una distribución normal.\n")
+      } else {
+        cat("✅ La variable sigue una distribución normal.\n")
+      }
     } else {
-      cat("Selecciona una variable numérica.")
+      cat("Selecciona una variable numérica con entre 3 y 5000 observaciones para el análisis de normalidad.")
     }
   })
   
@@ -244,47 +293,175 @@ server <- function(input, output, session) {
   output$outliers <- renderPrint({
     req(input$variables)
     var <- input$variables[1]
-    x <- datos()[[var]]
-    if (is.numeric(x)) {
-      q1 <- quantile(x, 0.25, na.rm = TRUE)
-      q3 <- quantile(x, 0.75, na.rm = TRUE)
+    datos_col <- datos()[[var]]
+    if (is.numeric(datos_col)) {
+      q1 <- quantile(datos_col, 0.25, na.rm = TRUE)
+      q3 <- quantile(datos_col, 0.75, na.rm = TRUE)
       iqr <- q3 - q1
-      outliers <- x[x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr)]
+      outliers <- datos_col[datos_col < (q1 - 1.5 * iqr) | datos_col > (q3 + 1.5 * iqr)]
+      
+      cat("Detección de valores atípicos:\n")
+      cat("Q1:", q1, "| Q3:", q3, "| IQR:", iqr, "\n")
       if (length(outliers) > 0) {
         cat("Se encontraron", length(outliers), "valores atípicos:\n")
-        print(outliers)
+        print(sort(outliers))
       } else {
-        cat("No se detectaron valores atípicos.")
+        cat("No se detectaron valores atípicos.\n")
       }
     } else {
-      cat("Selecciona una variable numérica.")
+      cat("Selecciona una variable numérica para detectar valores atípicos.")
     }
   })
   
-  # Boxplot por grupos
+  # Boxplot comparativo
   output$boxplot_grupos <- renderPlot({
     req(input$variables)
-    df <- datos()
-    if (length(input$variables) == 2) {
-      var1 <- df[[input$variables[1]]]
-      var2 <- df[[input$variables[2]]]
-      if (is.numeric(var1) && (is.factor(var2) || is.character(var2))) {
-        var2 <- as.factor(var2)
-        ggplot(df, aes(x = var2, y = var1)) +
-          geom_boxplot(fill = "#58D68D") +
-          labs(x = input$variables[2], y = input$variables[1]) +
-          theme_minimal()
-      } else if (is.numeric(var2) && (is.factor(var1) || is.character(var1))) {
-        var1 <- as.factor(var1)
-        ggplot(df, aes(x = var1, y = var2)) +
-          geom_boxplot(fill = "#F5B041") +
-          labs(x = input$variables[1], y = input$variables[2]) +
-          theme_minimal()
-      }
+    var <- input$variables[1]
+    datos_col <- datos()[[var]]
+    if (is.numeric(datos_col)) {
+      ggplot(datos(), aes(y = datos_col)) +
+        geom_boxplot(fill = "#2E86C1", color = "#1F618D") +
+        theme_minimal() +
+        labs(title = paste("Boxplot de", var), y = var) +
+        theme(axis.text.x = element_blank())
     }
   })
   
-  # Exportar tabla
+  # Prueba Chi-cuadrada
+  output$chi_cuadrada <- renderPrint({
+    req(input$variables)
+    var <- input$variables[1]
+    datos_col <- datos()[[var]]
+    if (is.factor(datos_col) || is.character(datos_col)) {
+      tabla <- table(datos_col)
+      if (length(tabla) > 1) {
+        chisq_result <- chisq.test(tabla)
+        cat("Resultado de la prueba Chi-cuadrada:\n")
+        cat("Estadístico Chi-cuadrada: ", round(chisq_result$statistic, 3), "\n")
+        cat("Grados de libertad: ", chisq_result$parameter, "\n")
+        cat("Valor p: ", round(chisq_result$p.value, 4), "\n")
+        cat("\nFrecuencias esperadas:\n")
+        print(chisq_result$expected)
+        cat("\n")
+        if (chisq_result$p.value < 0.05) {
+          cat("✅ La distribución NO es uniforme (p < 0.05).\n")
+        } else {
+          cat("ℹ️ No hay evidencia para rechazar la uniformidad (p >= 0.05).\n")
+        }
+      } else {
+        cat("Se necesitan al menos 2 categorías para la prueba Chi-cuadrada.")
+      }
+    } else {
+      cat("Selecciona una variable categórica para la prueba Chi-cuadrada.")
+    }
+  })
+  
+  # Teorema del Límite Central - Corrección del error de paréntesis y llaves
+  output$tlc_plot <- renderPlot({
+    req(input$variables)
+    var <- input$variables[1]
+    datos_col <- datos()[[var]]
+    if (is.numeric(datos_col)) {
+      set.seed(123)
+      muestras <- replicate(1000, mean(sample(datos_col, size = min(30, length(datos_col)), replace = TRUE)))
+      
+      ggplot(data.frame(x = muestras), aes(x = x)) +
+        geom_histogram(aes(y = ..density..), bins = 30, fill = "#3498DB", color = "white") +
+        geom_density(color = "#2874A6", size = 1) +
+        theme_minimal() +
+        labs(title = "Distribución de medias muestrales",
+             subtitle = "Teorema del Límite Central",
+             x = "Media muestral", y = "Densidad")
+    }
+  })
+  
+  # Teorema del Límite Central - Versión corregida
+  output$tlc <- renderPrint({
+    req(input$variables)
+    var <- input$variables[1]
+    datos_col <- datos()[[var]]
+    if (is.numeric(datos_col)) {
+      set.seed(123)
+      muestras <- replicate(1000, mean(sample(datos_col, length(datos_col), replace = TRUE)))
+      media_muestral <- mean(muestras)
+      sd_muestral <- sd(muestras)
+      
+      cat("Teorema del Límite Central:\n")
+      cat("Media poblacional: ", round(mean(datos_col, na.rm = TRUE), 3), "\n")
+      cat("Media de las medias muestrales: ", round(media_muestral, 3), "\n")
+      cat("Desviación estándar poblacional: ", round(sd(datos_col, na.rm = TRUE), 3), "\n")
+      cat("Desviación estándar de las medias muestrales: ", round(sd_muestral, 3), "\n")
+      cat("La distribución de las medias muestrales debería aproximarse a una normal.\n")
+    } else {
+      cat("Selecciona una variable numérica para realizar el TLC.")
+    }
+  })
+  
+  # Prueba de Wilcoxon
+  output$wilcoxon <- renderPrint({
+    req(input$variables)
+    if (length(input$variables) == 2) {
+      var1 <- datos()[[input$variables[1]]]
+      var2 <- datos()[[input$variables[2]]]
+      if (is.numeric(var1) && is.numeric(var2)) {
+        wilcox_test <- wilcox.test(var1, var2)
+        cat("Prueba de Wilcoxon (Mann-Whitney):\n")
+        cat("Estadístico W: ", wilcox_test$statistic, "\n")
+        cat("Valor p: ", round(wilcox_test$p.value, 4), "\n")
+        if (wilcox_test$p.value < 0.05) {
+          cat("✅ Existe diferencia significativa entre las distribuciones.\n")
+        } else {
+          cat("ℹ️ No hay diferencia significativa entre las distribuciones.\n")
+        }
+      } else {
+        cat("Selecciona dos variables numéricas.")
+      }
+    } else {
+      cat("Selecciona exactamente dos variables.")
+    }
+  })
+  
+  # Correlación de Spearman y Pearson
+  output$correlacion <- renderPrint({
+    req(input$variables)
+    if (length(input$variables) == 2) {
+      var1 <- datos()[[input$variables[1]]]
+      var2 <- datos()[[input$variables[2]]]
+      if (is.numeric(var1) && is.numeric(var2)) {
+        pearson <- cor.test(var1, var2, method = "pearson")
+        spearman <- cor.test(var1, var2, method = "spearman")
+        
+        cat("Correlación de Pearson:\n")
+        cat("Coeficiente: ", round(pearson$estimate, 3), "\n")
+        cat("Valor p: ", round(pearson$p.value, 4), "\n")
+        cat("Intervalo de confianza (95%): [", 
+            round(pearson$conf.int[1], 3), ", ", 
+            round(pearson$conf.int[2], 3), "]\n")
+        
+        cat("\nCorrelación de Spearman:\n")
+        cat("Coeficiente: ", round(spearman$estimate, 3), "\n")
+        cat("Valor p: ", round(spearman$p.value, 4), "\n")
+        
+        cat("\nInterpretación:\n")
+        if (pearson$p.value < 0.05) {
+          cat("✅ Pearson: Correlación significativa.\n")
+        } else {
+          cat("ℹ️ Pearson: Correlación no significativa.\n")
+        }
+        
+        if (spearman$p.value < 0.05) {
+          cat("✅ Spearman: Correlación significativa.\n")
+        } else {
+          cat("ℹ️ Spearman: Correlación no significativa.\n")
+        }
+      } else {
+        cat("Selecciona dos variables numéricas.")
+      }
+    } else {
+      cat("Selecciona exactamente dos variables.")
+    }
+  })
+  
   output$descargar_estadisticas <- downloadHandler(
     filename = function() { "estadisticas_descriptivas.csv" },
     content = function(file) {
@@ -295,6 +472,7 @@ server <- function(input, output, session) {
         if (is.numeric(col)) {
           data.frame(
             Variable = v,
+            Tipo = "Numérica",
             Media = mean(col, na.rm = TRUE),
             Mediana = median(col, na.rm = TRUE),
             Moda = moda_segura(col),
@@ -303,6 +481,13 @@ server <- function(input, output, session) {
             Rango = max(col, na.rm = TRUE) - min(col, na.rm = TRUE),
             Desv_Estandar = sd(col, na.rm = TRUE),
             Coef_Variacion = round(sd(col, na.rm = TRUE) / mean(col, na.rm = TRUE), 3)
+          )
+        } else {
+          data.frame(
+            Variable = v,
+            Tipo = "Categórica",
+            Categorías = length(unique(col)),
+            Moda = moda_segura(col)
           )
         }
       })
